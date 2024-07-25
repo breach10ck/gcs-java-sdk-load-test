@@ -1,27 +1,33 @@
 package com.google;
 
-import com.google.cloud.storage.BlobId;
-import com.google.cloud.storage.BlobInfo;
-import com.google.cloud.storage.Storage;
+import com.google.cloud.ReadChannel;
+import com.google.cloud.storage.*;
 import com.google.common.collect.ImmutableList;
+import com.google.common.io.ByteStreams;
 
 import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.file.Paths;
 import java.util.Random;
 import java.util.concurrent.ExecutionException;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 public class WriteAndKeepReadingSampler extends Thread {
     private static String FOLDER_NAME = "write_and_keep_reading/";
     private int numObjects;
     private String bucketName;
-    private int objectSize;
+    private ImmutableList<String> contentFiles;
     private Storage storage;
 
     WriteAndKeepReadingSampler(Storage storage, String bucketName,
-                               int numObjects, int objectSize) {
+                               int numObjects, String contentFolderPath) {
         this.storage = storage;
         this.bucketName = bucketName;
         this.numObjects = numObjects;
-        this.objectSize = objectSize;
+        this.contentFiles = listFilesFromFolder(contentFolderPath);
     }
 
     public void run() {
@@ -47,9 +53,16 @@ public class WriteAndKeepReadingSampler extends Thread {
 
     private void readObject(String bucketName, String objectName) {
         try {
-            byte[] content = storage.readAllBytes(bucketName, objectName);
-            //System.out.printf("Fetched object %s of size %d\n", objectName, content.length);
+            try(ReadChannel readChannel = storage.reader(BlobId.of(bucketName, objectName))) {
+                ByteBuffer bytes = ByteBuffer.allocate(64*1024);
+                while (readChannel.read(bytes) > 0) {
+                    bytes.flip();
+                    bytes.clear();
+                }
+            }
         } catch (RuntimeException e) {
+            System.out.println(e.getMessage());
+        } catch (IOException e) {
             System.out.println(e.getMessage());
         }
     }
@@ -57,24 +70,29 @@ public class WriteAndKeepReadingSampler extends Thread {
     private void writeObject(String bucketName, String objectName) {
         BlobId blobId = BlobId.of(bucketName, objectName);
         BlobInfo blobInfo = BlobInfo.newBuilder(blobId).build();
-        // Optional: set a generation-match precondition to avoid potential race
-        // conditions and data corruptions. The request returns a 412 error if the
-        // preconditions are not met.
         Storage.BlobWriteOption precondition;
         if (storage.get(bucketName, objectName) == null) {
-            // For a target object that does not yet exist, set the DoesNotExist precondition.
-            // This will cause the request to fail if the object is created before the request runs.
             precondition = Storage.BlobWriteOption.doesNotExist();
         } else {
-            // If the destination already exists in your bucket, instead set a generation-match
-            // precondition. This will cause the request to fail if the existing object's generation
-            // changes before the request runs.
             precondition =
                     Storage.BlobWriteOption.generationMatch(
                             storage.get(bucketName, objectName).getGeneration());
         }
-        ByteArrayInputStream inputStream = new ByteArrayInputStream(Util.generateObjectContent(objectSize).getBytes());
-        storage.create(blobInfo, inputStream, precondition);
+        String filePath = contentFiles.get(new Random().nextInt(contentFiles.size()));
+        try {
+            storage.createFrom(blobInfo, Paths.get(filePath), precondition);
+        } catch (IOException e) {
+            System.out.println(e.getMessage());
+        } catch (StorageException e) {
+            System.out.println(e.getMessage());
+        }
+    }
+
+    private static ImmutableList<String> listFilesFromFolder(String folder) {
+        return Stream.of(new File(folder).listFiles())
+                .filter(file -> !file.isDirectory())
+                .map(File::getPath)
+                .collect(ImmutableList.toImmutableList());
     }
 
 }
